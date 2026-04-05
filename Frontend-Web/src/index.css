@@ -1,0 +1,29 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+
+
+.input {
+  @apply w-full pl-10 pr-4 py-3 border border-gray-300 rounded-xl bg-white text-black placeholder:text-gray-400 outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-500;
+}
+
+.icon {
+  @apply absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 size-5;
+}
+
+.btn {
+  @apply w-full py-3 bg-gradient-to-r from-blue-600 to-purple-600 text-white rounded-xl;
+}
+
+.googleBtn {
+  @apply w-full flex items-center justify-center gap-2 border py-3 rounded-xl hover:bg-gray-50;
+}
+
+.divider {
+  @apply text-center text-gray-400 my-5;
+}
+
+.footer {
+  @apply text-center text-sm text-gray-500 mt-5 cursor-pointer;
+}

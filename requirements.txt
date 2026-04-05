@@ -1,7 +1,0 @@
-fastapi
-uvicorn
-pandas
-scikit-learn
-joblib
-python-multipart
-ujson  # Faster, lower-memory JSON parser
