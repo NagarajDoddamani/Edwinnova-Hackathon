@@ -1,12 +1,12 @@
 import json
+import math
 import os
 import uuid
 from collections import Counter, defaultdict
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
-import pdfplumber
-from fastapi import FastAPI, HTTPException, Depends, File, Form, UploadFile
+from fastapi import FastAPI, HTTPException, Depends, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 from pymongo import MongoClient
@@ -46,8 +46,7 @@ queries = db["queries"]
 goals = db["goals"]
 QUERY_PROMPT_TEMPLATE_PATH = Path(__file__).resolve().parent / "prompts" / "query_ai_prompt.txt"
 
-UPLOAD_DIR = os.getenv("UPLOAD_DIR", "uploads")
-MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "20"))
+MAX_TEXT_MB = int(os.getenv("MAX_FILE_MB", "20"))
 ALLOWED_DOC_TYPES = {"bank_statement", "it_return", "cibil"}
 
 _TXN_DATE_RE = re.compile(r"(\d{2}-\d{2}-\d{4})")
@@ -72,14 +71,6 @@ def _to_decimal(value: str | None) -> Decimal:
 
 def _quantize_two(value: Decimal) -> Decimal:
     return value.quantize(Decimal("0.01"))
-
-
-def _extract_pdf_text(file_path: Path) -> str:
-    pages: list[str] = []
-    with pdfplumber.open(file_path) as pdf:
-        for page in pdf.pages:
-            pages.append(page.extract_text() or "")
-    return "\n".join(pages)
 
 
 def _classify_transaction(description: str, txn_type: str) -> str:
@@ -120,7 +111,7 @@ def _estimate_month_count(text: str, transaction_dates: list[datetime]) -> int:
     return 1
 
 
-def _build_finance_payload_from_pdf(text: str) -> dict:
+def _build_finance_payload_from_text(text: str) -> dict:
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     categories = defaultdict(Decimal)
     transaction_dates: list[datetime] = []
@@ -186,35 +177,35 @@ def _build_finance_payload_from_pdf(text: str) -> dict:
 
     income_items = []
     if categories["salary"] > 0:
-        income_items.append({"name": "Salary (PDF)", "amount": monthly(categories["salary"]), "type": "fixed"})
+        income_items.append({"name": "Salary (Statement)", "amount": monthly(categories["salary"]), "type": "fixed"})
     if categories["other_income"] > 0:
-        income_items.append({"name": "Other Income (PDF)", "amount": monthly(categories["other_income"]), "type": "variable"})
+        income_items.append({"name": "Other Income (Statement)", "amount": monthly(categories["other_income"]), "type": "variable"})
     if not income_items and income_total > 0:
-        income_items.append({"name": "Bank Credits (PDF)", "amount": float(monthly_income_total), "type": "fixed"})
+        income_items.append({"name": "Bank Credits (Statement)", "amount": float(monthly_income_total), "type": "fixed"})
 
     expense_items = []
     for label, key, item_type in (
-        ("Loan EMI (PDF)", "emi", "fixed"),
-        ("Cash Withdrawal (PDF)", "cash", "variable"),
-        ("Transfers / Payments (PDF)", "transfer", "variable"),
-        ("Bank Charges (PDF)", "charges", "variable"),
-        ("Other Expenses (PDF)", "other_expense", "variable"),
+        ("Loan EMI (Statement)", "emi", "fixed"),
+        ("Cash Withdrawal (Statement)", "cash", "variable"),
+        ("Transfers / Payments (Statement)", "transfer", "variable"),
+        ("Bank Charges (Statement)", "charges", "variable"),
+        ("Other Expenses (Statement)", "other_expense", "variable"),
     ):
         if categories[key] > 0:
             expense_items.append({"name": label, "amount": monthly(categories[key]), "type": item_type})
 
     if not expense_items and expense_total > 0:
-        expense_items.append({"name": "Bank Debits (PDF)", "amount": float(monthly_expense_total), "type": "variable"})
+        expense_items.append({"name": "Bank Debits (Statement)", "amount": float(monthly_expense_total), "type": "variable"})
 
     liability_items = []
     if categories["emi"] > 0:
-        liability_items.append({"name": "EMI / Loan Obligation (PDF)", "amount": float(monthly_liability_total), "type": "fixed"})
+        liability_items.append({"name": "EMI / Loan Obligation (Statement)", "amount": float(monthly_liability_total), "type": "fixed"})
 
-    savings_items = [{"name": "Net Savings (PDF)", "amount": float(monthly_savings_total), "type": "fixed"}]
+    savings_items = [{"name": "Net Savings (Statement)", "amount": float(monthly_savings_total), "type": "fixed"}]
 
     return {
-        "income": income_items or [{"name": "Bank Credits (PDF)", "amount": 0.0, "type": "fixed"}],
-        "expenses": expense_items or [{"name": "Bank Debits (PDF)", "amount": 0.0, "type": "variable"}],
+        "income": income_items or [{"name": "Bank Credits (Statement)", "amount": 0.0, "type": "fixed"}],
+        "expenses": expense_items or [{"name": "Bank Debits (Statement)", "amount": 0.0, "type": "variable"}],
         "savings": savings_items,
         "liabilities": liability_items,
         "summary": {
@@ -332,6 +323,11 @@ class GoalInput(BaseModel):
     target_date: str | None = None
     monthly_target: float | None = None
 
+
+class CardRecommendationInput(BaseModel):
+    selected_requirements: List[str]
+    prompt: str | None = None
+
 # ================= ROOT =================
 
 @app.get("/")
@@ -444,7 +440,8 @@ def update_finance(fin: FinanceInput, data=Depends(verify_token)):
 @app.post("/documents/upload")
 def upload_document(
     document_type: str = Form("bank_statement"),
-    file: UploadFile = File(...),
+    statement_text: str = Form(...),
+    source_filename: str = Form("bank_statement.pdf"),
     data=Depends(verify_token),
 ):
     if document_type not in ALLOWED_DOC_TYPES:
@@ -453,21 +450,11 @@ def upload_document(
             f"document_type must be one of: {', '.join(sorted(ALLOWED_DOC_TYPES))}",
         )
 
-    filename = file.filename or ""
-    if not filename.lower().endswith(".pdf"):
-        raise HTTPException(400, "Only PDF files are accepted.")
+    text = (statement_text or "").strip()
+    if not text:
+        raise HTTPException(400, "statement_text is required.")
 
-    if file.content_type and file.content_type != "application/pdf":
-        raise HTTPException(400, "Invalid file type. Please upload a PDF.")
-
-    content = file.file.read()
-    if len(content) > MAX_FILE_MB * 1024 * 1024:
-        raise HTTPException(400, f"File too large. Max {MAX_FILE_MB} MB.")
-
-    dest_dir = Path(UPLOAD_DIR) / data["email"]
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    dest = dest_dir / f"{uuid.uuid4()}.pdf"
-    dest.write_bytes(content)
+    filename = (source_filename or "bank_statement.pdf").strip() or "bank_statement.pdf"
 
     try:
         if document_type != "bank_statement":
@@ -475,7 +462,7 @@ def upload_document(
                 "message": "Document uploaded successfully.",
                 "document_type": document_type,
                 "filename": filename,
-                "status": "stored",
+                "status": "received",
                 "income": [],
                 "expenses": [],
                 "savings": [],
@@ -493,8 +480,10 @@ def upload_document(
                 },
             }
 
-        text = _extract_pdf_text(dest)
-        parsed = _build_finance_payload_from_pdf(text)
+        if len(text) > MAX_TEXT_MB * 1024 * 1024:
+            raise HTTPException(400, f"Extracted text too large. Max {MAX_TEXT_MB} MB.")
+
+        parsed = _build_finance_payload_from_text(text)
 
         finance.update_one(
             {"email": data["email"]},
@@ -506,10 +495,11 @@ def upload_document(
                     "savings": parsed["savings"],
                     "liabilities": parsed["liabilities"],
                     "totals": parsed["summary"]["totals"],
-                    "last_pdf_upload": {
+                    "last_statement_upload": {
                         "document_type": document_type,
                         "filename": filename,
-                        "stored_path": str(dest),
+                        "source": "frontend_text",
+                        "text_length": len(text),
                         "updated_at": datetime.utcnow(),
                     },
                 }
@@ -522,8 +512,10 @@ def upload_document(
         parsed["filename"] = filename
         parsed["status"] = "parsed"
         return parsed
+    except HTTPException:
+        raise
     except Exception as exc:
-        raise HTTPException(500, f"Failed to process PDF: {exc}") from exc
+        raise HTTPException(500, f"Failed to process statement text: {exc}") from exc
 
 # ================= QUERY =================
 
@@ -917,6 +909,682 @@ def get_analysis(user=Depends(verify_token)):
         "debt_pressure": scores["debt_pressure"],
     }
 
+
+SPENDING_KEYWORDS = {
+    "dining": ["dining", "restaurant", "cafe", "food", "swiggy", "zomato", "eat", "hotel"],
+    "travel": ["travel", "flight", "airline", "train", "bus", "taxi", "cab", "uber", "ola", "booking", "trip"],
+    "grocery": ["grocery", "supermarket", "mart", "dmart", "kirana", "bigbasket"],
+    "fuel": ["fuel", "petrol", "diesel", "gas", "hpcl", "ioc", "bpcl", "pump"],
+    "online": ["online", "amazon", "flipkart", "myntra", "paytm", "phonepe", "gpay", "google pay", "subscription", "netflix", "spotify", "app store", "play store"],
+}
+
+
+def _normalize_text(value) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip().lower()
+
+
+def _load_user_profile(email: str) -> dict:
+    return users.find_one({"email": email}, {"_id": 0, "password": 0}) or {}
+
+
+def _build_spending_profile(snapshot: dict) -> dict:
+    doc = snapshot.get("doc") or {}
+    expenses = doc.get("expenses")
+    profile = {key: 0.0 for key in ("dining", "travel", "grocery", "fuel", "online", "other")}
+    has_itemized_data = False
+
+    if isinstance(expenses, list) and expenses:
+        has_itemized_data = True
+        for item in expenses:
+            if not isinstance(item, dict):
+                continue
+
+            amount = float(item.get("amount", 0) or 0)
+            if amount <= 0:
+                continue
+
+            name = _normalize_text(item.get("name"))
+            matched_category = None
+            for category, keywords in SPENDING_KEYWORDS.items():
+                if any(keyword in name for keyword in keywords):
+                    matched_category = category
+                    break
+
+            if matched_category:
+                profile[matched_category] += amount
+            else:
+                profile["other"] += amount
+    else:
+        total_expenses = float(snapshot.get("expenses", 0) or 0)
+        if total_expenses > 0:
+            profile = {
+                "dining": round(total_expenses * 0.15, 2),
+                "travel": round(total_expenses * 0.10, 2),
+                "grocery": round(total_expenses * 0.30, 2),
+                "fuel": round(total_expenses * 0.10, 2),
+                "online": round(total_expenses * 0.25, 2),
+                "other": round(total_expenses * 0.10, 2),
+            }
+
+    total_spend = round(sum(profile.values()), 2)
+    return {
+        "profile": profile,
+        "total_spend": total_spend,
+        "has_itemized_data": has_itemized_data,
+        "has_spend": total_spend > 0,
+    }
+
+
+def get_card_recommendations(spending: dict) -> list[dict]:
+    results = []
+    catalog = _load_credit_card_catalog()
+    if not catalog:
+        catalog = CARD_RECOMMENDATIONS_DATA
+
+    for card in catalog:
+        monthly_reward = 0.0
+        for category, amount in spending.items():
+            monthly_reward += float(amount or 0) * card["category_rewards"].get(category, card["reward_rate"])
+
+        annual_reward = monthly_reward * 12
+        net_benefit = annual_reward - card["annual_fee"]
+        results.append(
+            {
+                "card_name": card["card_name"],
+                "bank": card["bank"],
+                "annual_fee": card["annual_fee"],
+                "monthly_reward_value": round(monthly_reward, 0),
+                "annual_reward_value": round(annual_reward, 0),
+                "net_annual_benefit": round(net_benefit, 0),
+                "hidden_benefits": card["hidden_benefits"],
+                "best_for": card["best_for"],
+            }
+        )
+
+    return sorted(results, key=lambda item: item["net_annual_benefit"], reverse=True)
+
+
+def _build_credit_card_ai_insight(recommendations: list[dict]) -> dict | None:
+    if not recommendations:
+        return None
+
+    top_card = recommendations[0]
+    best_value = max(float(top_card.get("net_annual_benefit", 0) or 0), 0.0)
+
+    if best_value <= 0:
+        insight = "Your spend is better suited to a no-fee card than a premium card."
+    else:
+        best_for = top_card.get("best_for") or []
+        category = best_for[0] if best_for else "current"
+        insight = f"{top_card['card_name']} is the strongest match for your {category} spend."
+
+    return {
+        "insight": insight,
+        "missing_value": round(best_value, 0),
+    }
+
+
+def _build_debit_reward_tips(spending_profile: dict, employment_type: str) -> list[dict]:
+    ranked = sorted(
+        ((category, amount) for category, amount in spending_profile.items() if category != "other" and amount > 0),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    top_categories = [category for category, _ in ranked[:2]]
+    tips: list[dict] = []
+
+    if "online" in top_categories:
+        tips.append(
+            {
+                "title": "Use online debit offers",
+                "description": "Your online spending can unlock cashback, bill-pay deals, and merchant offers.",
+                "action": "Check your bank app before paying online.",
+            }
+        )
+    elif "grocery" in top_categories:
+        tips.append(
+            {
+                "title": "Reward grocery runs",
+                "description": "Grocery and supermarket spending often qualify for debit card offers.",
+                "action": "Look for grocery-specific bank offers each week.",
+            }
+        )
+    elif "fuel" in top_categories:
+        tips.append(
+            {
+                "title": "Save on fuel",
+                "description": "Fuel spends can pick up surcharge waivers and partner discounts.",
+                "action": "Use debit cards that cover fuel waivers.",
+            }
+        )
+    elif "travel" in top_categories:
+        tips.append(
+            {
+                "title": "Track travel offers",
+                "description": "Travel and booking spends often trigger seasonal debit discounts.",
+                "action": "Check travel merchant offers before booking.",
+            }
+        )
+    else:
+        tips.append(
+            {
+                "title": "Use bank offers first",
+                "description": "Debit cards still give reward value when you use bank-led offers well.",
+                "action": "Open the bank app before paying.",
+            }
+        )
+
+    tips.append(
+        {
+            "title": "Keep a healthy balance",
+            "description": "Rewards only help if your account balance stays comfortable.",
+            "action": "Keep one month of expenses in the account.",
+        }
+    )
+
+    if employment_type in {"student", "freelancer", "self_employed", "unemployed"}:
+        tips.append(
+            {
+                "title": "Prefer zero-fee banking",
+                "description": "Irregular income works better with simple accounts and no annual fees.",
+                "action": "Avoid premium fee-based cards for now.",
+            }
+        )
+    else:
+        tips.append(
+            {
+                "title": "Use salary-linked offers",
+                "description": "If your income is stable, debit and salary-account offers are easier to use.",
+                "action": "Check payroll-linked cashbacks each month.",
+            }
+        )
+
+    return tips[:3]
+
+
+@app.get("/cards/recommendations")
+def card_recommendations(data=Depends(verify_token)):
+    user = _load_user_profile(data["email"])
+    employment_type = _normalize_text(user.get("employment_type"))
+    snapshot = _load_finance_snapshot(data["email"])
+    spending = _build_spending_profile(snapshot)
+
+    if not spending["has_spend"] or employment_type not in {"salaried", "business"}:
+        return {
+            "eligible": False,
+            "employment_type": employment_type or None,
+            "recommendations": [],
+            "ai_insight": None,
+        }
+
+    recommendations = get_card_recommendations(spending["profile"])
+    return {
+        "eligible": True,
+        "employment_type": employment_type,
+        "spending_profile": spending["profile"],
+        "recommendations": recommendations,
+        "ai_insight": _build_credit_card_ai_insight(recommendations),
+    }
+
+
+@app.get("/cards/debit-rewards")
+def debit_rewards(data=Depends(verify_token)):
+    user = _load_user_profile(data["email"])
+    employment_type = _normalize_text(user.get("employment_type"))
+    snapshot = _load_finance_snapshot(data["email"])
+    spending = _build_spending_profile(snapshot)
+
+    if not spending["has_spend"]:
+        return {
+            "eligible": False,
+            "employment_type": employment_type or None,
+            "tips": [],
+        }
+
+    return {
+        "eligible": True,
+        "employment_type": employment_type,
+        "tips": _build_debit_reward_tips(spending["profile"], employment_type),
+    }
+
+
+CARD_CATALOG_PATH = Path(__file__).resolve().parent / "data" / "credit_cards.json"
+
+CARD_REQUIREMENT_ALIASES = {
+    "petrol": "fuel",
+    "fuel": "fuel",
+    "diesel": "fuel",
+    "airplane_booking": "travel",
+    "flight_booking": "travel",
+    "travel": "travel",
+    "hotel_booking": "travel",
+    "hotel": "travel",
+    "airport": "travel",
+    "airport_lounge": "travel",
+    "lounge": "travel",
+    "dining": "dining",
+    "restaurant": "dining",
+    "online_shopping": "online",
+    "shopping": "online",
+    "cashback": "online",
+    "grocery": "grocery",
+    "lounge_access": "travel",
+    "movie_entertainment": "online",
+    "entertainment": "online",
+    "fee_waiver": "fee_waiver",
+}
+
+CARD_REQUIREMENT_LABELS = {
+    "petrol": "Petrol / Fuel",
+    "fuel": "Petrol / Fuel",
+    "flight_booking": "Flight booking",
+    "travel": "Travel",
+    "hotel_booking": "Hotel booking",
+    "dining": "Dining",
+    "online_shopping": "Online shopping",
+    "online": "Online shopping",
+    "grocery": "Grocery",
+    "cashback": "Cashback",
+    "lounge_access": "Lounge access",
+    "movie_entertainment": "Movies / entertainment",
+    "fee_waiver": "Fee waiver",
+}
+
+
+def _load_credit_card_catalog() -> list[dict]:
+    try:
+        if CARD_CATALOG_PATH.exists():
+            raw_catalog = json.loads(CARD_CATALOG_PATH.read_text(encoding="utf-8"))
+            if isinstance(raw_catalog, list):
+                catalog = []
+                for item in raw_catalog:
+                    if not isinstance(item, dict):
+                        continue
+                    catalog.append(
+                        {
+                            "card_name": str(item.get("card_name", "")).strip(),
+                            "bank": str(item.get("bank", "")).strip(),
+                            "annual_fee": float(item.get("annual_fee", 0) or 0),
+                            "reward_rate": float(item.get("reward_rate", 0) or 0),
+                            "category_rewards": {
+                                str(key).strip().lower(): float(value or 0)
+                                for key, value in (item.get("category_rewards") or {}).items()
+                            },
+                            "hidden_benefits": _normalize_text_list(item.get("hidden_benefits"), limit=3),
+                            "best_for": _normalize_text_list(item.get("best_for"), limit=5),
+                        }
+                    )
+                if catalog:
+                    return catalog
+    except Exception as exc:
+        print("CARD CATALOG LOAD ERROR:", type(exc).__name__, exc)
+
+    return CARD_RECOMMENDATIONS_DATA
+
+
+def _catalog_last_updated() -> str | None:
+    try:
+        if CARD_CATALOG_PATH.exists():
+            return datetime.fromtimestamp(CARD_CATALOG_PATH.stat().st_mtime).isoformat()
+    except Exception as exc:
+        print("CARD CATALOG MTIME ERROR:", type(exc).__name__, exc)
+    return None
+
+
+def _normalize_card_requirement(value: str) -> str | None:
+    key = _normalize_text(value).replace(" ", "_")
+    return CARD_REQUIREMENT_ALIASES.get(key, key or None)
+
+
+def _normalize_card_requirements(values: list[str] | None) -> list[str]:
+    normalized: list[str] = []
+    for value in values or []:
+        item = _normalize_card_requirement(value)
+        if item and item not in normalized:
+            normalized.append(item)
+    return normalized
+
+
+def _friendly_card_requirement(value: str) -> str:
+    key = _normalize_card_requirement(value) or _normalize_text(value)
+    return CARD_REQUIREMENT_LABELS.get(key, str(value).replace("_", " ").strip().title())
+
+
+def _score_credit_card_candidate(
+    card: dict,
+    normalized_requirements: list[str],
+    raw_requirements: list[str],
+    spending_profile: dict,
+    analysis: dict,
+) -> dict:
+    reward_map = {str(key).strip().lower(): float(value or 0) for key, value in (card.get("category_rewards") or {}).items()}
+    best_for = {_normalize_text(item) for item in (card.get("best_for") or [])}
+    reward_categories = {category for category, rate in reward_map.items() if float(rate or 0) > 0}
+    annual_fee = float(card.get("annual_fee", 0) or 0)
+    card_text = " ".join(
+        [
+            str(card.get("card_name", "")),
+            str(card.get("bank", "")),
+            " ".join(card.get("best_for") or []),
+            " ".join(card.get("hidden_benefits") or []),
+            " ".join(reward_categories),
+        ]
+    ).lower()
+    matched_requirements = []
+    for requirement in normalized_requirements:
+        if requirement == "fee_waiver":
+            if annual_fee == 0:
+                matched_requirements.append(requirement)
+            elif annual_fee <= 500:
+                matched_requirements.append(requirement)
+            continue
+        if requirement in reward_categories or requirement in best_for:
+            matched_requirements.append(requirement)
+
+    for requirement in raw_requirements:
+        raw_phrase = _normalize_text(requirement)
+        if not raw_phrase:
+            continue
+        if raw_phrase in card_text:
+            if raw_phrase not in matched_requirements:
+                matched_requirements.append(raw_phrase)
+            continue
+
+        raw_tokens = [token for token in raw_phrase.split(" ") if len(token) > 2]
+        if raw_tokens and any(token in card_text for token in raw_tokens):
+            if raw_phrase not in matched_requirements:
+                matched_requirements.append(raw_phrase)
+
+    monthly_reward = 0.0
+    for category, amount in spending_profile.items():
+        monthly_reward += float(amount or 0) * float(reward_map.get(category, card.get("reward_rate", 0) or 0))
+
+    annual_reward = monthly_reward * 12
+    net_benefit = annual_reward - annual_fee
+
+    score = len(matched_requirements) * 100 + (net_benefit / 1000)
+    if annual_fee == 0:
+        score += 15
+    elif annual_fee <= 500:
+        score += 8
+    elif annual_fee <= 1000:
+        score += 4
+
+    debt_pressure = float(analysis.get("debt_pressure", 0) or 0)
+    savings_rate = float(analysis.get("savings_rate", 0) or 0)
+    if debt_pressure >= 25 and annual_fee > 1000:
+        score -= 15
+    if savings_rate < 10 and annual_fee > 0:
+        score -= 8
+
+    fit_notes = []
+    if matched_requirements:
+        fit_notes.append("Matches " + ", ".join(matched_requirements[:3]))
+    if annual_fee == 0:
+        fit_notes.append("No annual fee")
+    elif annual_fee <= 1000:
+        fit_notes.append("Low fee")
+    if not fit_notes:
+        fit_notes.append("Good general fit")
+
+    return {
+        "card_name": card.get("card_name"),
+        "bank": card.get("bank"),
+        "annual_fee": round(annual_fee, 0),
+        "net_annual_benefit": round(net_benefit, 0),
+        "estimated_annual_reward": round(annual_reward, 0),
+        "reward_categories": sorted(reward_categories),
+        "best_for": card.get("best_for", []),
+        "hidden_benefits": card.get("hidden_benefits", [])[:2],
+        "matched_requirements": matched_requirements,
+        "fit_note": "; ".join(fit_notes),
+        "score": round(score, 2),
+    }
+
+
+def _retrieve_credit_card_candidates(
+    catalog: list[dict],
+    normalized_requirements: list[str],
+    raw_requirements: list[str],
+    spending_profile: dict,
+    analysis: dict,
+    limit: int = 4,
+) -> list[dict]:
+    ranked = [
+        _score_credit_card_candidate(card, normalized_requirements, raw_requirements, spending_profile, analysis)
+        for card in catalog
+    ]
+    ranked.sort(key=lambda item: item["score"], reverse=True)
+    return ranked[:limit]
+
+
+def _build_credit_card_context(
+    user_email: str,
+    selected_requirements: list[str],
+    prompt_text: str | None,
+) -> dict:
+    snapshot = _load_finance_snapshot(user_email)
+    goal_docs = _load_goals(user_email)
+    scores = _build_analysis_scores(snapshot, goal_docs) if snapshot.get("has_data") else {
+        "total_score": 0,
+        "grade": "F",
+        "savings_rate": 0,
+        "debt_pressure": 0,
+        "financial_goals": "No active goal",
+    }
+    spending = _build_spending_profile(snapshot)
+    user = _load_user_profile(user_email)
+    employment_type = _normalize_text(user.get("employment_type")) or "unknown"
+    normalized_requirements = _normalize_card_requirements(selected_requirements)
+    catalog = _load_credit_card_catalog()
+    retrieved_cards = _retrieve_credit_card_candidates(
+        catalog,
+        normalized_requirements,
+        selected_requirements,
+        spending["profile"],
+        scores,
+    )
+
+    summary = {
+        "income": snapshot["income"],
+        "expenses": snapshot["expenses"],
+        "savings": snapshot["savings"],
+        "debt": snapshot["debt"],
+        "emi": snapshot["emi"],
+        "total_score": scores.get("total_score", 0),
+        "grade": scores.get("grade", "F"),
+        "savings_rate": scores.get("savings_rate", 0),
+        "debt_pressure": scores.get("debt_pressure", 0),
+        "goal_count": len(goal_docs),
+        "financial_goals": scores.get("financial_goals", "No active goal"),
+        "employment_type": employment_type,
+    }
+
+    return {
+        "prompt": (prompt_text or "").strip() or "Suggest the best credit card for the user.",
+        "catalog_last_updated": _catalog_last_updated(),
+        "selected_requirements": _normalize_text_list(selected_requirements, limit=10),
+        "normalized_requirements": normalized_requirements,
+        "financial_summary": summary,
+        "spending_profile": spending["profile"],
+        "retrieved_cards": retrieved_cards,
+    }
+
+
+def _build_credit_card_prompt(context: dict) -> str:
+    payload = json.dumps(context, separators=(",", ":"), default=str)
+    return (
+        "You are FinArmor's credit-card analyst.\n"
+        "Use only the supplied financial summary, selected requirements, and retrieved card catalog.\n"
+        "Do not mention age, gender, marital status, or location.\n"
+        "Return only compact JSON that matches the response schema exactly.\n"
+        "Choose the best card from the retrieved catalog and keep every string short.\n"
+        "Set decision to a short verdict such as Recommend, Compare, or Wait.\n"
+        "The best_card and ranked_cards entries must include card_name, bank, annual_fee, net_annual_benefit, score, and why.\n"
+        "If the user is a weak fit for fee-based cards, prefer a low-fee or no-fee option and say why.\n"
+        "Use the selected requirements as the primary ranking signal, then use reward fit, fee, and the financial summary.\n"
+        "Do not recommend any card outside the retrieved catalog.\n\n"
+        f"User prompt:\n{context.get('prompt', '')}\n\n"
+        f"Context:\n{payload}"
+    )
+
+
+def _validate_credit_card_ai_response(response: dict) -> bool:
+    if not isinstance(response, dict):
+        return False
+
+    for key in ("summary", "decision", "best_card", "ranked_cards", "matched_requirements", "warnings", "next_step"):
+        if key not in response:
+            return False
+
+    best_card = response.get("best_card")
+    if not isinstance(best_card, dict):
+        return False
+
+    for key in ("card_name", "bank", "annual_fee", "net_annual_benefit", "why"):
+        if key not in best_card:
+            return False
+
+    if not isinstance(response.get("ranked_cards"), list):
+        return False
+    if not isinstance(response.get("matched_requirements"), list):
+        return False
+    if not isinstance(response.get("warnings"), list):
+        return False
+
+    return True
+
+
+def _build_credit_card_local_response(context: dict) -> dict:
+    financial = context.get("financial_summary") or {}
+    selected_requirements = context.get("selected_requirements") or []
+    ranked_cards = context.get("retrieved_cards") or []
+
+    debt_pressure = float(financial.get("debt_pressure", 0) or 0)
+    savings_rate = float(financial.get("savings_rate", 0) or 0)
+
+    def _response_card(card: dict) -> dict:
+        return {
+            "card_name": card.get("card_name", ""),
+            "bank": card.get("bank", ""),
+            "annual_fee": int(round(float(card.get("annual_fee", 0) or 0))),
+            "net_annual_benefit": int(round(float(card.get("net_annual_benefit", 0) or 0))),
+            "score": round(float(card.get("score", 0) or 0), 2),
+            "why": card.get("fit_note") or "Matches your selected needs.",
+        }
+
+    if not ranked_cards:
+        return {
+            "summary": "No suitable card match found in the current catalog.",
+            "decision": "Wait",
+            "best_card": {
+                "card_name": "No match",
+                "bank": "",
+                "annual_fee": 0,
+                "net_annual_benefit": 0,
+                "score": 0,
+                "why": "Add more cards to the catalog or refine the selected requirements.",
+            },
+            "ranked_cards": [],
+            "matched_requirements": [],
+            "warnings": [
+                "Add more credit cards to the JSON catalog.",
+                "Update the spending data for a better match.",
+            ],
+            "next_step": "Add card data or choose clearer card requirements.",
+        }
+
+    ranked_payload = [_response_card(card) for card in ranked_cards[:4]]
+    best_card = ranked_payload[0]
+    best_source = ranked_cards[0]
+    matched_requirements = best_source.get("matched_requirements") or []
+    selected_preview = ", ".join(selected_requirements[:3]) if selected_requirements else "your needs"
+    matched_preview = ", ".join(_friendly_card_requirement(item) for item in matched_requirements[:3]) if matched_requirements else selected_preview
+
+    summary = f"{best_card['card_name']} is the strongest match for {matched_preview}."
+    decision = "Recommend" if best_card["net_annual_benefit"] > 0 else "Compare"
+    next_step = "Choose the best-match card and verify the fee waiver rules."
+    warnings = []
+
+    if debt_pressure >= 35:
+        decision = "Wait"
+        summary = "Debt pressure is high, so a no-fee or wait-and-check approach is safer."
+        next_step = "Lower EMI pressure before taking a new credit card."
+        warnings.append("Debt pressure is high. Prefer no-fee cards for now.")
+    elif savings_rate < 10 and best_card["annual_fee"] > 0:
+        decision = "Compare"
+        warnings.append("Savings rate is low. Be careful with annual fees.")
+
+    if best_card["annual_fee"] == 0:
+        warnings.append("This card has no annual fee.")
+    elif best_card["annual_fee"] > 1000:
+        warnings.append("This card has a meaningful annual fee.")
+
+    if best_card["net_annual_benefit"] <= 0:
+        warnings.append("Current spending does not fully cover the fee.")
+
+    if not warnings:
+        warnings.append("Good fit for the selected requirements.")
+
+    return {
+        "summary": summary,
+        "decision": decision,
+        "best_card": best_card,
+        "ranked_cards": ranked_payload,
+        "matched_requirements": [_friendly_card_requirement(item) for item in matched_requirements[:5]],
+        "warnings": warnings[:3],
+        "next_step": next_step,
+    }
+
+
+@app.post("/cards/personalized")
+def personalized_credit_card_recommendation(
+    payload: CardRecommendationInput,
+    data=Depends(verify_token),
+):
+    selected_requirements = _normalize_text_list(payload.selected_requirements, limit=10)
+    if not selected_requirements:
+        raise HTTPException(400, "selected_requirements must contain at least one requirement.")
+
+    context = _build_credit_card_context(data["email"], selected_requirements, payload.prompt)
+    prompt = _build_credit_card_prompt(context)
+    local_response = _build_credit_card_local_response(context)
+    ai_response = None
+
+    try:
+        gemini_packet = call_llm(
+            prompt,
+            schema=CARD_PERSONALIZED_SCHEMA,
+            temperature=0.2,
+            max_output_tokens=700,
+        )
+        if isinstance(gemini_packet, dict) and _validate_credit_card_ai_response(gemini_packet):
+            ai_response = gemini_packet
+        else:
+            print("CREDIT CARD AI GEMINI ERROR: invalid or empty structured response, using local RAG result.")
+            print("CREDIT CARD AI PROMPT:")
+            print(prompt)
+            print("CREDIT CARD AI CONTEXT:")
+            print(json.dumps(context, indent=2, default=str))
+    except HTTPException as exc:
+        print("CREDIT CARD AI GEMINI ERROR:", exc.detail)
+    except Exception as exc:
+        print("CREDIT CARD AI UNEXPECTED ERROR:", type(exc).__name__, exc)
+
+    if ai_response is None:
+        ai_response = local_response
+
+    return {
+        "eligible": True,
+        "catalog_last_updated": context["catalog_last_updated"],
+        "selected_requirements": context["selected_requirements"],
+        "normalized_requirements": context["normalized_requirements"],
+        "retrieved_cards": context["retrieved_cards"],
+        "response": ai_response,
+        "source": "gemini" if ai_response is not local_response else "local_rag",
+    }
+
+
 # ==============AI part===========
 def extract_user_question(payload: dict) -> str:
     """
@@ -1060,6 +1728,61 @@ QUERY_INTENT_KEYWORDS = {
     ],
 }
 
+QUERY_GENERAL_INFO_CUES = [
+    "how to",
+    "how do i",
+    "how can i",
+    "how open",
+    "what is",
+    "what are",
+    "difference between",
+    "compare",
+    "comparison between",
+    "steps to",
+    "process to",
+    "meaning of",
+    "benefits of",
+    "features of",
+    "open account",
+    "account opening",
+    "opening account",
+    "documents required",
+    "documents needed",
+    "eligibility for",
+    "apply for",
+    "guide to",
+]
+
+QUERY_GENERAL_DECISION_CUES = [
+    "invest",
+    "investment",
+    "buy",
+    "purchase",
+    "save",
+    "savings",
+    "repay",
+    "repayment",
+    "debt",
+    "emi",
+    "loan",
+    "goal",
+    "target",
+    "budget",
+    "allocate",
+    "split",
+    "plan",
+    "recommend",
+    "suggest",
+    "choose",
+    "pick",
+    "select",
+    "should i",
+    "which",
+    "best",
+    "worth",
+    "afford",
+]
+
 ASSET_ALIAS_MAP = {
     "SIP": ["sip", "systematic investment plan"],
     "Stocks": ["stock", "stocks", "equity", "shares", "share market"],
@@ -1155,8 +1878,27 @@ def _extract_asset_mentions(question: str) -> list[str]:
     return mentions
 
 
+def _is_general_information_query(normalized: str) -> bool:
+    if not normalized:
+        return False
+
+    has_info_cue = any(cue in normalized for cue in QUERY_GENERAL_INFO_CUES)
+    has_decision_cue = any(cue in normalized for cue in QUERY_GENERAL_DECISION_CUES)
+
+    return has_info_cue and not has_decision_cue
+
+
 def _classify_query_intent(question: str) -> dict:
     normalized = _normalize_query_text(question)
+    if _is_general_information_query(normalized):
+        asset_mentions = _extract_asset_mentions(question)
+        return {
+            "primary": "general",
+            "secondary": [],
+            "scores": {intent: 0 for intent in QUERY_INTENT_KEYWORDS},
+            "asset_mentions": asset_mentions,
+        }
+
     scores = {intent: 0 for intent in QUERY_INTENT_KEYWORDS}
 
     for intent, phrases in QUERY_INTENT_KEYWORDS.items():
@@ -1513,6 +2255,40 @@ QUERY_AI_PACKET_SCHEMA = {
         "summary": {"type": "string"},
         "intent": {"type": "string"},
         "decision": {"type": "string"},
+        "plan": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+        "breakdown": {
+            "type": "object",
+            "properties": {
+                "savings": {"type": "number"},
+                "investment": {"type": "number"},
+                "expenses": {"type": "number"},
+                "emi": {"type": "number"},
+                "allocation_label": {"type": "string"},
+            },
+        },
+        "investment_strategy": {
+            "type": "object",
+            "properties": {
+                "low_risk": {"type": "string"},
+                "medium_risk": {"type": "string"},
+                "high_risk": {"type": "string"},
+            },
+        },
+        "goal_projection": {
+            "type": "object",
+            "properties": {
+                "target_amount": {"type": "integer"},
+                "saved_amount": {"type": "integer"},
+                "remaining_amount": {"type": "integer"},
+                "monthly_required": {"type": "integer"},
+                "estimated_months": {"type": "integer"},
+                "progress": {"type": "number"},
+                "next_step": {"type": "string"},
+            },
+        },
         "recommended_assets": {
             "type": "array",
             "items": {"type": "string"},
@@ -1548,6 +2324,8 @@ QUERY_AI_PACKET_SCHEMA = {
         "summary",
         "intent",
         "decision",
+        "plan",
+        "breakdown",
         "recommended_assets",
         "readiness_label",
         "readiness_reason",
@@ -1557,6 +2335,15 @@ QUERY_AI_PACKET_SCHEMA = {
         "warnings",
         "next_step",
     ],
+}
+
+QUERY_GENERAL_PACKET_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "summary": {"type": "string"},
+        "intent": {"type": "string"},
+    },
+    "required": ["summary", "intent"],
 }
 
 DASHBOARD_AI_SCHEMA = {
@@ -1628,6 +2415,59 @@ DASHBOARD_AI_SCHEMA = {
 }
 
 
+CARD_PERSONALIZED_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "summary": {"type": "string"},
+        "decision": {"type": "string"},
+        "best_card": {
+            "type": "object",
+            "properties": {
+                "card_name": {"type": "string"},
+                "bank": {"type": "string"},
+                "annual_fee": {"type": "number"},
+                "net_annual_benefit": {"type": "number"},
+                "why": {"type": "string"},
+            },
+            "required": ["card_name", "bank", "annual_fee", "net_annual_benefit", "why"],
+        },
+        "ranked_cards": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "card_name": {"type": "string"},
+                    "bank": {"type": "string"},
+                    "annual_fee": {"type": "number"},
+                    "net_annual_benefit": {"type": "number"},
+                    "score": {"type": "number"},
+                    "why": {"type": "string"},
+                },
+                "required": ["card_name", "bank", "annual_fee", "net_annual_benefit", "score", "why"],
+            },
+        },
+        "matched_requirements": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+        "warnings": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+        "next_step": {"type": "string"},
+    },
+    "required": [
+        "summary",
+        "decision",
+        "best_card",
+        "ranked_cards",
+        "matched_requirements",
+        "warnings",
+        "next_step",
+    ],
+}
+
+
 def _to_int_amount(value) -> int:
     try:
         return max(int(round(float(value or 0))), 0)
@@ -1650,10 +2490,244 @@ def _build_split_payload(total: int, emergency_pct: float, debt_pct: float, savi
     }
 
 
+def _intent_allocation_label(intent: str) -> str:
+    intent_key = (intent or "").strip().lower()
+    return {
+        "investment": "Investment",
+        "goal": "Goal Contribution",
+        "debt": "Debt Paydown",
+        "savings": "Savings Buffer",
+        "purchase": "Purchase Budget",
+    }.get(intent_key, "Surplus")
+
+
+def _build_query_plan(query_context: dict, intent: str, risk_level: str, goal_context: dict) -> list[str]:
+    financial = query_context["financial"]
+    monthly_surplus = max(float(financial.get("monthly_surplus", 0) or 0), 0.0)
+    debt_ratio = max(float(financial.get("debt_to_income_pct", 0) or 0), 0.0)
+    savings_rate = max(float(financial.get("savings_rate_pct", 0) or 0), 0.0)
+    buffer_months = max(float(financial.get("emergency_buffer_months", 0) or 0), 0.0)
+    requested_amount = _to_int_amount(financial.get("requested_amount", 0))
+    monthly_target = _to_int_amount(goal_context.get("monthly_target", goal_context.get("recommended_monthly_contribution", 0)))
+    goal_title = goal_context.get("title") or "your goal"
+    goal_status = str(goal_context.get("status") or "no_goal").lower()
+    asset_mentions = query_context.get("asset_mentions", [])
+
+    if intent == "investment":
+        if risk_level == "High" or debt_ratio >= 35 or buffer_months < 3:
+            return [
+                "Keep the emergency buffer intact before adding risk.",
+                "Use FD, RD, or gold until debt pressure falls.",
+                "Revisit higher-risk investing after the savings rate improves.",
+            ]
+        if risk_level == "Medium" or savings_rate < 20:
+            return [
+                "Start with a balanced SIP in diversified funds.",
+                "Keep a small safety bucket in cash-like assets.",
+                "Review the mix once savings stay above 20%.",
+            ]
+        recommendation = "Use a balanced mix of SIPs and safe reserves."
+        if asset_mentions:
+            recommendation = f"Use {', '.join(asset_mentions[:2])} only if they fit the risk bucket."
+        return [
+            recommendation,
+            "Keep high-risk assets as a small long-term slice.",
+            "Rebalance monthly against savings and EMI pressure.",
+        ]
+
+    if intent == "goal":
+        if not goal_context.get("has_active_goal"):
+            return [
+                "Create one clear goal with a target amount.",
+                "Choose a monthly contribution you can keep steady.",
+                "Review progress weekly until the goal is active.",
+            ]
+        if goal_status == "completed":
+            return [
+                "Move surplus to the next priority now that the goal is funded.",
+                "Keep the emergency buffer intact.",
+                "Start the next goal or invest gradually.",
+            ]
+        if goal_status in {"catch_up", "building"} or buffer_months < 3 or savings_rate < 15:
+            return [
+                "Fund the goal before riskier investing.",
+                f"Save {format_currency(monthly_target or max(int(monthly_surplus * 0.5), 0))} every month for {goal_title}.",
+                "Keep the emergency buffer untouched until the plan is stable.",
+            ]
+        return [
+            "Keep the monthly goal contribution steady.",
+            "Use the active surplus to stay on track.",
+            "Review the goal once each month.",
+        ]
+
+    if intent == "debt":
+        return [
+            "Pay EMI and high-interest debt first.",
+            "Pause new borrowing until pressure drops.",
+            "Revisit investing after debt pressure improves.",
+        ]
+
+    if intent == "savings":
+        if monthly_surplus <= 0:
+            return [
+                "Reduce spending until cash flow turns positive.",
+                "Protect the current buffer from discretionary use.",
+                "Set a small automated savings step once cash flow improves.",
+            ]
+        return [
+            "Automate savings from each income cycle.",
+            "Build a 3 to 6 month emergency buffer.",
+            "Invest only after the buffer is stable.",
+        ]
+
+    if intent == "purchase":
+        if requested_amount <= 0:
+            return [
+                "Get the exact purchase amount before deciding.",
+                "Compare the cost with savings and monthly surplus.",
+                "Protect the emergency buffer before buying.",
+            ]
+        return [
+            "Compare the price with safe capacity and the emergency buffer.",
+            "Downsize or wait if the purchase would strain cash flow.",
+            "Keep debt pressure low before making the purchase.",
+        ]
+
+    return [
+        "Keep the emergency buffer intact.",
+        "Follow the strongest priority from your current profile.",
+        "Review the plan once every month.",
+    ]
+
+
+def _build_query_breakdown(query_context: dict, split: dict, intent: str) -> dict:
+    financial = query_context["financial"]
+    allocation_label = _intent_allocation_label(intent)
+    suggested_allocation = split.get("investment")
+
+    return {
+        "savings": _to_int_amount(financial.get("savings", 0)),
+        "investment": _to_int_amount(suggested_allocation if suggested_allocation is not None else financial.get("monthly_surplus", 0)),
+        "expenses": _to_int_amount(financial.get("expenses", 0)),
+        "emi": _to_int_amount(financial.get("emi", 0)),
+        "allocation_label": allocation_label,
+    }
+
+
+def _build_query_investment_strategy(query_context: dict, risk_level: str) -> dict | None:
+    intent = str(query_context.get("intent") or "").strip().lower()
+    if intent != "investment":
+        return None
+
+    financial = query_context["financial"]
+    debt_ratio = max(float(financial.get("debt_to_income_pct", 0) or 0), 0.0)
+    savings_rate = max(float(financial.get("savings_rate_pct", 0) or 0), 0.0)
+    asset_mentions = query_context.get("asset_mentions", [])
+
+    if risk_level == "High" or debt_ratio >= 35:
+        low_risk = "Use FD, RD, or gold until debt pressure falls."
+        medium_risk = "Pause medium-risk investing until the buffer improves."
+        high_risk = "Avoid stocks and other volatile assets for now."
+    elif risk_level == "Medium" or savings_rate < 20:
+        low_risk = "Keep the safety bucket in FD or RD."
+        medium_risk = "Use a balanced SIP in diversified mutual funds."
+        high_risk = "Limit equity exposure to a small long-term slice."
+    else:
+        low_risk = "Use FD, RD, or gold for the safety bucket."
+        medium_risk = "Blend SIPs with diversified funds for growth."
+        high_risk = "Keep high-risk assets small and review them monthly."
+
+    if asset_mentions:
+        low_risk = f"Use {', '.join(asset_mentions[:2])} only if they fit the safety bucket."
+
+    return {
+        "low_risk": low_risk,
+        "medium_risk": medium_risk,
+        "high_risk": high_risk,
+    }
+
+
+def _build_query_goal_projection(query_context: dict) -> dict | None:
+    intent = str(query_context.get("intent") or "").strip().lower()
+    goal_context = query_context.get("goal_context") or {}
+    if intent != "goal" or not goal_context.get("has_active_goal"):
+        return None
+
+    financial = query_context["financial"]
+    target_amount = _to_int_amount(goal_context.get("target_amount", 0))
+    saved_amount = _to_int_amount(goal_context.get("saved_amount", 0))
+    remaining_amount = _to_int_amount(goal_context.get("remaining_amount", max(target_amount - saved_amount, 0)))
+    monthly_required = _to_int_amount(goal_context.get("monthly_target", goal_context.get("recommended_monthly_contribution", 0)))
+    if monthly_required <= 0 and remaining_amount > 0:
+        monthly_required = _to_int_amount(max(remaining_amount / 12, financial.get("monthly_surplus", 0) * 0.4))
+
+    estimated_months = int(math.ceil(remaining_amount / monthly_required)) if monthly_required > 0 and remaining_amount > 0 else 0
+
+    return {
+        "target_amount": target_amount,
+        "saved_amount": saved_amount,
+        "remaining_amount": remaining_amount,
+        "monthly_required": monthly_required,
+        "estimated_months": estimated_months,
+        "progress": float(goal_context.get("progress", 0) or 0),
+        "next_step": str(goal_context.get("next_step") or "Keep saving steadily.").strip(),
+    }
+
+
+def _build_general_query_summary(query_context: dict) -> str:
+    question = _normalize_query_text(str(query_context.get("question") or ""))
+    asset_mentions = query_context.get("asset_mentions", [])
+    rag_context = query_context.get("rag_context") or []
+
+    if "fd" in question or "fixed deposit" in question or "bank fd" in question:
+        return "Open an FD by comparing rates, choosing a tenure, completing KYC, and funding the deposit."
+    if "rd" in question or "recurring deposit" in question:
+        return "Open an RD by choosing the bank, setting a monthly amount, completing KYC, and enabling auto-debit."
+    if "sip" in question or "mutual fund" in question or "index fund" in question:
+        return "Start a SIP by selecting a fund, completing KYC, linking your bank account, and setting the monthly amount."
+    if "gold" in question:
+        return "Gold is usually a defensive allocation, so compare costs, liquidity, and your time horizon before buying."
+    if "stock" in question or "shares" in question or "equity" in question:
+        return "Open a brokerage account, complete KYC, learn the basics, and start with a small amount."
+    if "property" in question or "real estate" in question or "house" in question:
+        return "Compare location, paperwork, financing, and long-term holding costs before buying property."
+
+    if asset_mentions:
+        first_asset = asset_mentions[0]
+        guidance_map = {
+            "FD": "Open an FD by comparing rates, choosing a tenure, completing KYC, and funding the deposit.",
+            "RD": "Open an RD by choosing the bank, setting a monthly amount, completing KYC, and enabling auto-debit.",
+            "SIP": "Start a SIP by selecting a fund, completing KYC, linking your bank account, and setting the monthly amount.",
+            "Mutual Fund": "Start with fund selection, KYC, bank linking, and a small monthly SIP.",
+            "Gold": "Compare costs, liquidity, and time horizon before buying gold.",
+            "Stocks": "Open a brokerage account, complete KYC, and keep the initial amount small.",
+            "Real Estate": "Compare location, paperwork, financing, and holding costs before buying property.",
+        }
+        if first_asset in guidance_map:
+            return guidance_map[first_asset]
+
+    if rag_context:
+        top = rag_context[0] if isinstance(rag_context[0], dict) else {}
+        title = str(top.get("title") or "").strip()
+        content = str(top.get("content") or "").strip()
+        if title and content:
+            return f"{title}. {content}"
+        if content:
+            return content
+
+    return "This is a general question, so no financial plan is needed."
+
+
 def build_fallback_response(query_context: dict) -> dict:
     financial = query_context["financial"]
     goal_context = query_context.get("goal_context") or {}
     intent = (query_context.get("intent") or "mixed").strip().lower()
+
+    if intent == "general":
+        return {
+            "intent": "general",
+            "summary": _build_general_query_summary(query_context),
+        }
 
     requested_amount = _to_int_amount(financial.get("requested_amount", 0))
     income = max(float(financial.get("income", 0) or 0), 0.0)
@@ -1842,24 +2916,32 @@ def build_fallback_response(query_context: dict) -> dict:
         )
 
     summary = f'{readiness["label"]}. {next_step}'
+    plan = _build_query_plan(query_context, intent, risk["level"], goal_context)
+    breakdown = _build_query_breakdown(query_context, split, intent)
     chart_labels = query_context.get("chart_blueprint") or [
         "Emergency Fund",
         "Debt / EMI",
         "Savings",
         "Investment",
     ]
-    effective_asset_intent = "goal" if (intent == "goal" or goal_context.get("has_active_goal")) else intent
+    effective_asset_intent = intent
     recommended_assets = _default_recommended_assets(
         effective_asset_intent,
         risk["level"],
         query_context.get("asset_mentions", []),
     )
+    investment_strategy = _build_query_investment_strategy(query_context, risk["level"])
+    goal_projection = _build_query_goal_projection(query_context)
 
     return {
         "summary": summary,
+        "plan": plan,
+        "breakdown": breakdown,
         "readiness": readiness,
         "risk": risk,
         "recommended_assets": recommended_assets,
+        "investment_strategy": investment_strategy,
+        "goal_projection": goal_projection,
         "split": split,
         "chart": {
             "labels": chart_labels,
@@ -1894,13 +2976,17 @@ def _load_prompt_template(path: Path) -> str:
 
 def build_ai_prompt(context: dict) -> str:
     template = _load_prompt_template(QUERY_PROMPT_TEMPLATE_PATH)
+    intent = str(context.get("intent") or "general").strip().lower()
+    schema = QUERY_GENERAL_PACKET_SCHEMA if intent == "general" else QUERY_AI_PACKET_SCHEMA
     if not template:
         template = (
-            "You are FinArmor's financial decision assistant.\n"
-            "Return only compact JSON that matches the schema exactly.\n"
-            "Solve the user's actual question using the backend context.\n"
-            "Support purchase, investment, debt, savings, goal, and mixed intents.\n"
-            "Use the active goal if present.\n\n"
+            "You are FinArmor AI, a smart financial advisor inside a fintech app.\n"
+            "Classify the user's intent first and return only compact JSON that matches the schema exactly.\n"
+            "If the question is general or informational, return only intent and summary.\n"
+            "For general how-to questions, put the short steps directly into summary.\n"
+            "Do not emit financial breakdowns, allocations, or projections for general questions.\n"
+            "Use the backend context, keep every string short, and set non-applicable category sections to null.\n"
+            "Support investment, savings, goal, debt, purchase, mixed, and general intents.\n\n"
             "User question:\n{{USER_QUESTION}}\n\n"
             "Response schema:\n{{RESPONSE_SCHEMA_JSON}}\n\n"
             "Backend context:\n{{QUERY_CONTEXT_JSON}}\n"
@@ -1908,7 +2994,7 @@ def build_ai_prompt(context: dict) -> str:
 
     return (
         template.replace("{{USER_QUESTION}}", str(context.get("question", "")).strip())
-        .replace("{{RESPONSE_SCHEMA_JSON}}", json.dumps(QUERY_AI_PACKET_SCHEMA, indent=2))
+        .replace("{{RESPONSE_SCHEMA_JSON}}", json.dumps(schema, indent=2))
         .replace("{{QUERY_CONTEXT_JSON}}", json.dumps(context, indent=2, default=str))
     )
 
@@ -2022,10 +3108,16 @@ def _validate_query_response_payload(response: dict) -> bool:
     if not isinstance(response, dict):
         return False
 
+    if str(response.get("intent") or "").strip().lower() == "general":
+        summary = response.get("summary")
+        return isinstance(summary, str) and bool(summary.strip())
+
     required = [
         "summary",
         "intent",
         "decision",
+        "plan",
+        "breakdown",
         "recommended_assets",
         "readiness_label",
         "readiness_reason",
@@ -2040,6 +3132,10 @@ def _validate_query_response_payload(response: dict) -> bool:
         if key not in response:
             return False
 
+    if not isinstance(response.get("plan"), list) or len(response.get("plan")) == 0:
+        return False
+    if not isinstance(response.get("breakdown"), dict):
+        return False
     if not isinstance(response.get("recommended_assets"), list) or len(response.get("recommended_assets")) == 0:
         return False
     if not isinstance(response.get("why"), list):
@@ -2256,7 +3352,17 @@ def _build_query_split_and_chart(query_context: dict, readiness_label: str, risk
 
 def _format_query_response(query_context: dict, packet: dict) -> dict:
     financial = query_context["financial"]
-    intent = (packet.get("intent") or query_context["intent"] or "mixed").strip().lower()
+    query_intent = str(query_context.get("intent") or "general").strip().lower()
+    packet_intent = str(packet.get("intent") or "").strip().lower()
+    if query_intent == "general":
+        summary = str(packet.get("summary") or "").strip() or _build_general_query_summary(query_context)
+        return {
+            "intent": "general",
+            "summary": summary,
+        }
+
+    allowed_intents = {"investment", "savings", "goal", "debt", "purchase"}
+    intent = packet_intent if packet_intent == query_intent and packet_intent in allowed_intents else query_intent
     risk_level, risk_reason = _default_risk(intent, financial)
     readiness_label, readiness_reason = _default_readiness(intent, risk_level)
     goal_context = query_context.get("goal_context") or {}
@@ -2295,6 +3401,53 @@ def _format_query_response(query_context: dict, packet: dict) -> dict:
         fallback=_default_recommended_assets(intent, risk_level, query_context.get("asset_mentions", [])),
         limit=4,
     )
+    packet_plan = packet.get("plan")
+    plan = _normalize_text_list(
+        packet_plan if isinstance(packet_plan, list) else None,
+        fallback=_build_query_plan(query_context, intent, risk_level, goal_context),
+        limit=3,
+    )
+    breakdown = _build_query_breakdown(query_context, packet.get("split") if isinstance(packet.get("split"), dict) else {}, intent)
+    packet_breakdown = packet.get("breakdown") if isinstance(packet.get("breakdown"), dict) else None
+    if packet_breakdown:
+        for key in ("savings", "investment", "expenses", "emi"):
+            if key in packet_breakdown and packet_breakdown[key] is not None:
+                breakdown[key] = _to_int_amount(packet_breakdown[key])
+        if packet_breakdown.get("allocation_label"):
+            breakdown["allocation_label"] = str(packet_breakdown.get("allocation_label")).strip()
+    investment_strategy = None
+    if intent == "investment":
+        investment_strategy = _build_query_investment_strategy(query_context, risk_level)
+        packet_strategy = packet.get("investment_strategy") if isinstance(packet.get("investment_strategy"), dict) else None
+        if packet_strategy and investment_strategy:
+            merged_strategy = investment_strategy.copy()
+            for key in ("low_risk", "medium_risk", "high_risk"):
+                if packet_strategy.get(key):
+                    merged_strategy[key] = str(packet_strategy.get(key)).strip()
+            investment_strategy = merged_strategy
+        elif packet_strategy:
+            investment_strategy = {
+                "low_risk": str(packet_strategy.get("low_risk") or "").strip(),
+                "medium_risk": str(packet_strategy.get("medium_risk") or "").strip(),
+                "high_risk": str(packet_strategy.get("high_risk") or "").strip(),
+            }
+    goal_projection = None
+    if intent == "goal":
+        goal_projection = _build_query_goal_projection(query_context)
+        packet_projection = packet.get("goal_projection") if isinstance(packet.get("goal_projection"), dict) else None
+        if goal_projection and packet_projection:
+            merged_projection = goal_projection.copy()
+            for key in ("target_amount", "saved_amount", "remaining_amount", "monthly_required", "estimated_months"):
+                if packet_projection.get(key) is not None:
+                    merged_projection[key] = _to_int_amount(packet_projection.get(key))
+            if packet_projection.get("progress") is not None:
+                try:
+                    merged_projection["progress"] = float(packet_projection.get("progress"))
+                except (TypeError, ValueError):
+                    pass
+            if packet_projection.get("next_step"):
+                merged_projection["next_step"] = str(packet_projection.get("next_step")).strip()
+            goal_projection = merged_projection
     why = _normalize_text_list(
         packet.get("why"),
         fallback=[
@@ -2328,6 +3481,14 @@ def _format_query_response(query_context: dict, packet: dict) -> dict:
             "next_step": str(goal_context.get("next_step") or next_step).strip(),
         }
 
+        if goal_projection:
+            default_goal_focus["target_amount"] = int(goal_projection.get("target_amount", default_goal_focus["target_amount"]) or 0)
+            default_goal_focus["saved_amount"] = int(goal_projection.get("saved_amount", default_goal_focus["saved_amount"]) or 0)
+            default_goal_focus["remaining_amount"] = int(goal_projection.get("remaining_amount", default_goal_focus["remaining_amount"]) or 0)
+            default_goal_focus["monthly_target"] = int(goal_projection.get("monthly_required", default_goal_focus["monthly_target"]) or 0)
+            default_goal_focus["progress"] = float(goal_projection.get("progress", default_goal_focus["progress"]) or 0)
+            default_goal_focus["next_step"] = str(goal_projection.get("next_step") or default_goal_focus["next_step"]).strip()
+
         if goal_focus:
             merged_goal_focus = default_goal_focus.copy()
             merged_goal_focus.update(goal_focus)
@@ -2344,10 +3505,15 @@ def _format_query_response(query_context: dict, packet: dict) -> dict:
             risk_level_value,
         )
 
+    if not packet_breakdown:
+        breakdown = _build_query_breakdown(query_context, split, intent)
+
     response = {
         "summary": summary,
         "intent": intent,
         "decision": decision,
+        "plan": plan,
+        "breakdown": breakdown,
         "recommended_assets": recommended_assets,
         "readiness": {
             "label": readiness_label_value,
@@ -2357,6 +3523,8 @@ def _format_query_response(query_context: dict, packet: dict) -> dict:
             "level": risk_level_value,
             "reason": risk_reason_value,
         },
+        "investment_strategy": investment_strategy,
+        "goal_projection": goal_projection,
         "split": split,
         "chart": chart,
         "why": why,
@@ -2443,17 +3611,54 @@ def _call_llm_strict(
 
 
 def _build_query_ai_response(user_email: str, user_query: str) -> tuple[dict, str]:
+    intent_info = _classify_query_intent(user_query)
+
+    if intent_info["primary"] == "general":
+        query_context = {
+            "question": user_query,
+            "intent": "general",
+            "secondary_intents": [],
+            "asset_mentions": intent_info["asset_mentions"],
+            "financial": {},
+            "goal_context": {},
+            "decision_hint": "General question. Keep the answer short and practical.",
+            "chart_blueprint": [],
+            "rag_context": _retrieve_rag_context(user_query, "general", intent_info["asset_mentions"]),
+        }
+        fallback = _format_query_response(query_context, build_fallback_response(query_context))
+
+        prompt = build_ai_prompt(query_context)
+        gemini_packet = None
+        try:
+            gemini_packet = call_llm(
+                prompt,
+                schema=QUERY_GENERAL_PACKET_SCHEMA,
+                temperature=0.2,
+                max_output_tokens=220,
+            )
+        except HTTPException as exc:
+            if exc.status_code != 429:
+                print("QUERY AI GEMINI ERROR:", exc.detail)
+
+        if isinstance(gemini_packet, dict):
+            response = _format_query_response(query_context, gemini_packet)
+            if _validate_query_response_payload(response):
+                return response, "gemini"
+
+        return fallback, "fallback"
+
     snapshot = _load_finance_snapshot(user_email)
     goal_docs = _load_goals(user_email)
     query_context = _build_query_context(snapshot, user_query, goal_docs)
     fallback = _format_query_response(query_context, build_fallback_response(query_context))
 
     prompt = build_ai_prompt(query_context)
+    schema = QUERY_AI_PACKET_SCHEMA
     gemini_packet = None
     try:
         gemini_packet = call_llm(
             prompt,
-            schema=QUERY_AI_PACKET_SCHEMA,
+            schema=schema,
             temperature=0.2,
             max_output_tokens=900,
         )
@@ -2752,4 +3957,3 @@ def ai_query(data: dict, user=Depends(verify_token)):
         print("AI QUERY ERROR:", e)
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
-

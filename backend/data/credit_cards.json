@@ -1,0 +1,210 @@
+[
+  {
+    "card_name": "SBI Cashback Credit Card",
+    "bank": "SBI Card",
+    "annual_fee": 999,
+    "reward_rate": 0.01,
+    "category_rewards": {
+      "online": 0.05,
+      "offline": 0.01,
+      "dining": 0.01,
+      "grocery": 0.01,
+      "fuel": 0.0
+    },
+    "hidden_benefits": [
+      "Cashback auto-credited to statement within two working days",
+      "Annual fee waiver on spending ₹2 Lakh [2]"
+    ],
+    "best_for": ["online shopping", "direct cashback"]
+  },
+  {
+    "card_name": "ICICI Amazon Pay",
+    "bank": "ICICI Bank",
+    "annual_fee": 0,
+    "reward_rate": 0.01,
+    "category_rewards": {
+      "online": 0.05,
+      "dining": 0.02,
+      "grocery": 0.02,
+      "travel": 0.02,
+      "fuel": 0.01
+    },
+    "hidden_benefits": [
+      "Unlimited 5% cashback for Amazon Prime members",
+      "1% fuel surcharge waiver across India [3]",
+      "Cashback credited directly to Amazon Pay wallet"
+    ],
+    "best_for": ["Amazon users", "lifetime free"]
+  },
+  {
+    "card_name": "Axis Atlas",
+    "bank": "Axis Bank",
+    "annual_fee": 5000,
+    "reward_rate": 0.02,
+    "category_rewards": {
+      "travel": 0.05,
+      "dining": 0.02,
+      "online": 0.02,
+      "grocery": 0.02,
+      "fuel": 0.01
+    },
+    "hidden_benefits": [
+      "1:2 transfer ratio to major airline and hotel partners [4, 2]",
+      "Up to 18 domestic and 12 international lounge visits annually [4]",
+      "Edge Miles valued at ₹1 for travel portal bookings"
+    ],
+    "best_for": ["frequent flyers", "air miles"]
+  },
+  {
+    "card_name": "HDFC Regalia Gold",
+    "bank": "HDFC Bank",
+    "annual_fee": 2500,
+    "reward_rate": 0.0133,
+    "category_rewards": {
+      "travel": 0.133,
+      "dining": 0.05,
+      "online": 0.067,
+      "grocery": 0.013,
+      "fuel": 0.01
+    },
+    "hidden_benefits": [
+      "Flight vouchers worth ₹5,000 on ₹5 Lakh annual spend [2]",
+      "Complimentary Swiggy One and MMT Black Gold memberships",
+      "12 domestic and 6 international lounge visits per year"
+    ],
+    "best_for": ["lifestyle", "travel"]
+  },
+  {
+    "card_name": "SBI SimplyCLICK",
+    "bank": "SBI Card",
+    "annual_fee": 499,
+    "reward_rate": 0.0125,
+    "category_rewards": {
+      "online": 0.025,
+      "dining": 0.01,
+      "travel": 0.01,
+      "grocery": 0.01,
+      "partner_online": 0.05
+    },
+    "hidden_benefits": [
+      "₹500 Amazon gift voucher on joining",
+      "Annual fee waiver on spending ₹1 Lakh"
+    ],
+    "best_for": ["online shopping", "entry-level"]
+  },
+  {
+    "card_name": "Axis ACE Credit Card",
+    "bank": "Axis Bank",
+    "annual_fee": 499,
+    "reward_rate": 0.02,
+    "category_rewards": {
+      "utility": 0.05,
+      "dining": 0.04,
+      "travel": 0.02,
+      "grocery": 0.02,
+      "online": 0.02
+    },
+    "hidden_benefits": [
+      "5% cashback on utility bills via Google Pay [5, 6]",
+      "4 domestic airport lounge visits per year [5, 6]",
+      "Up to 20% discount at select restaurants [3, 6]"
+    ],
+    "best_for": ["utility bills", "uncomplicated cashback"]
+  },
+  {
+    "card_name": "ICICI Emeralde Private Metal",
+    "bank": "ICICI Bank",
+    "annual_fee": 12499,
+    "reward_rate": 0.03,
+    "category_rewards": {
+      "online": 0.03,
+      "dining": 0.03,
+      "travel": 0.03,
+      "grocery": 0.03,
+      "fuel": 0.01
+    },
+    "hidden_benefits": [
+      "Unlimited domestic and international lounge access for primary and add-on cards [1]",
+      "BOGO offer on movie tickets up to ₹750 [1]",
+      "Unlimited complimentary rounds of golf globally [7]",
+      "Low 1.5% foreign currency markup [5]"
+    ],
+    "best_for": ["ultra-HNIs", "simple rewards"]
+  },
+  {
+    "card_name": "Standard Chartered Ultimate",
+    "bank": "Standard Chartered",
+    "annual_fee": 5000,
+    "reward_rate": 0.033,
+    "category_rewards": {
+      "travel": 0.033,
+      "dining": 0.033,
+      "online": 0.033,
+      "grocery": 0.02,
+      "fuel": 0.01
+    },
+    "hidden_benefits": [
+      "1:1 reward point value for vouchers and merchandise",
+      "5% cashback on duty-free spends globally",
+      "16 domestic and 12 international lounge visits per year"
+    ],
+    "best_for": ["consistent rewards", "lifestyle"]
+  },
+  {
+    "card_name": "HDFC Diners Club Black",
+    "bank": "HDFC Bank",
+    "annual_fee": 10000,
+    "reward_rate": 0.033,
+    "category_rewards": {
+      "travel": 0.33,
+      "dining": 0.166,
+      "online": 0.033,
+      "grocery": 0.033,
+      "fuel": 0.01
+    },
+    "hidden_benefits": [
+      "Unlimited global airport lounge access for primary and guests [1, 2]",
+      "6 complimentary golf games per quarter [2]",
+      "Low forex markup of 2% for international spends [2]"
+    ],
+    "best_for": ["high rewards", "premium memberships"]
+  },
+  {
+    "card_name": "Axis Airtel Bank Credit Card",
+    "bank": "Axis Bank",
+    "annual_fee": 500,
+    "reward_rate": 0.01,
+    "category_rewards": {
+      "airtel": 0.25,
+      "utility": 0.1,
+      "dining": 0.1,
+      "grocery": 0.01,
+      "fuel": 0.01
+    },
+    "hidden_benefits": [
+      "10% cashback on utility bills (electricity, water, gas)",
+      "10% cashback on Swiggy, Zomato, and BigBasket",
+      "4 domestic lounge visits per year"
+    ],
+    "best_for": ["Airtel users", "household bills"]
+  },
+  {
+    "card_name": "Tata Neu Infinity HDFC",
+    "bank": "HDFC Bank",
+    "annual_fee": 1499,
+    "reward_rate": 0.015,
+    "category_rewards": {
+      "tata_brands": 0.05,
+      "upi": 0.015,
+      "utility": 0.02,
+      "dining": 0.05,
+      "travel": 0.05
+    },
+    "hidden_benefits": [
+      "10% stacked value on select Tata purchases with NeuPass",
+      "8 domestic and 4 international lounge visits per year [1]",
+      "1:1 redemption ratio across Tata ecosystem brands"
+    ],
+    "best_for": []
+  }
+]

@@ -1,7 +1,41 @@
 import { useState } from "react";
+import { getDocument, GlobalWorkerOptions } from "pdfjs-dist/legacy/build/pdf.mjs";
+import pdfWorkerUrl from "pdfjs-dist/legacy/build/pdf.worker.mjs?url";
 import { useNavigate } from "react-router-dom";
 import { api } from "../services/api";
 import { TrendingUp } from "lucide-react";
+
+GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
+
+async function extractPdfText(file, onProgress) {
+  const buffer = await file.arrayBuffer();
+  const loadingTask = getDocument({ data: new Uint8Array(buffer) });
+  const pdf = await loadingTask.promise;
+  const totalPages = pdf.numPages || 0;
+  const pages = [];
+
+  for (let pageNumber = 1; pageNumber <= totalPages; pageNumber += 1) {
+    const page = await pdf.getPage(pageNumber);
+    const content = await page.getTextContent();
+    const pageText = content.items
+      .map((item) => (item && typeof item.str === "string" ? item.str : ""))
+      .join(" ")
+      .trim();
+
+    if (pageText) pages.push(pageText);
+
+    if (typeof onProgress === "function" && totalPages > 0) {
+      const progress = 20 + (pageNumber / totalPages) * 65;
+      onProgress(Math.min(progress, 85));
+    }
+  }
+
+  if (typeof pdf.destroy === "function") {
+    await pdf.destroy();
+  }
+
+  return pages.join("\n").trim();
+}
 
 export default function CompleteProfile() {
   const navigate = useNavigate();
@@ -51,6 +85,15 @@ export default function CompleteProfile() {
     const selectedFile = e.target.files[0];
     if (!selectedFile) return;
 
+    if (
+      selectedFile.type !== "application/pdf" &&
+      !selectedFile.name.toLowerCase().endsWith(".pdf")
+    ) {
+      alert("Please upload a PDF bank statement.");
+      e.target.value = "";
+      return;
+    }
+
     setFile(selectedFile);
     setProcessing(true);
     setProgress(10);
@@ -58,18 +101,23 @@ export default function CompleteProfile() {
     setUploadSummary(null);
 
     try {
+      setProgress(20);
+      const statementText = await extractPdfText(selectedFile, setProgress);
+
+      if (!statementText) {
+        throw new Error(
+          "No readable text was found in the PDF. If it is scanned, try a text-based bank statement."
+        );
+      }
+
+      setProgress(90);
+
       const formData = new FormData();
       formData.append("document_type", "bank_statement");
-      formData.append("file", selectedFile);
+      formData.append("statement_text", statementText);
+      formData.append("source_filename", selectedFile.name);
 
-      const res = await api.post("/documents/upload", formData, {
-        onUploadProgress: (event) => {
-          if (!event.total) return;
-
-          const uploadProgress = 10 + (event.loaded / event.total) * 60;
-          setProgress(Math.min(uploadProgress, 85));
-        },
-      });
+      const res = await api.post("/documents/upload", formData);
 
       const payload = res.data || {};
       const responseData = payload.income ? payload : payload.data || payload;
@@ -107,7 +155,7 @@ export default function CompleteProfile() {
         setUploadSummary(null);
         alert(
           payload.message ||
-            "The backend accepted the PDF, but it did not return structured financial data."
+            "The backend accepted the statement text, but it did not return structured financial data."
         );
       }
 
@@ -122,7 +170,8 @@ export default function CompleteProfile() {
       alert(
         err.response?.data?.detail ||
           err.response?.data?.message ||
-          "Failed to process PDF"
+          err.message ||
+          "Failed to process bank statement"
       );
       setProgress(0);
       setProcessing(false);
@@ -183,7 +232,7 @@ export default function CompleteProfile() {
       {processing && (
         <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
           <div className="bg-white p-6 rounded-xl w-[300px] text-center">
-            <h3 className="font-semibold mb-2">Processing PDF...</h3>
+            <h3 className="font-semibold mb-2">Converting PDF to text...</h3>
 
             <div className="w-full bg-gray-200 h-2 rounded">
               <div
@@ -193,6 +242,9 @@ export default function CompleteProfile() {
             </div>
 
             <p className="text-sm mt-2">{Math.round(progress)}%</p>
+            <p className="text-xs text-gray-500 mt-2">
+              Conversion happens in your browser before upload.
+            </p>
           </div>
         </div>
       )}
@@ -239,14 +291,14 @@ export default function CompleteProfile() {
 
             {uploadSummary && (
               <div className="mt-3 rounded-2xl border border-blue-100 bg-blue-50 px-4 py-3 text-sm text-blue-700">
-                Parsed {uploadSummary.transactions || 0} transactions across{" "}
+                Extracted {uploadSummary.transactions || 0} transactions across{" "}
                 {uploadSummary.months || 0} months.
               </div>
             )}
 
             {isAutoFilled && (
               <p className="text-green-600 text-sm mt-2">
-                ✔ Data extracted. Please verify below.
+                Data extracted. Please verify below.
               </p>
             )}
           </div>

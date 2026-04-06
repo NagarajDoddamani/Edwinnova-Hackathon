@@ -5,7 +5,7 @@
 
 
 .input {
-  @apply w-full pl-10 pr-4 py-3 border border-gray-300 rounded-xl bg-white text-black placeholder:text-gray-400 outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-500;
+  @apply w-full pl-10 pr-4 py-3 border border-gray-200 rounded-xl bg-white text-slate-900 placeholder:text-gray-400 outline-none focus:border-cyan-500 focus:ring-2 focus:ring-cyan-500;
 }
 
 .icon {
@@ -13,11 +13,11 @@
 }
 
 .btn {
-  @apply w-full py-3 bg-gradient-to-r from-blue-600 to-purple-600 text-white rounded-xl;
+  @apply w-full py-3 bg-cyan-400 text-slate-950 rounded-xl font-semibold hover:bg-cyan-300;
 }
 
 .googleBtn {
-  @apply w-full flex items-center justify-center gap-2 border py-3 rounded-xl hover:bg-gray-50;
+  @apply w-full flex items-center justify-center gap-2 border border-gray-200 bg-white py-3 rounded-xl text-slate-700 hover:bg-gray-50;
 }
 
 .divider {
@@ -26,4 +26,36 @@
 
 .footer {
   @apply text-center text-sm text-gray-500 mt-5 cursor-pointer;
+}
+
+@keyframes chat-fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes chart-pop-in {
+  from {
+    opacity: 0;
+    transform: translateY(14px) scale(0.99);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.chat-fade-in {
+  animation: chat-fade-in 220ms ease-out both;
+}
+
+.chart-pop-in {
+  animation: chart-pop-in 260ms ease-out both;
 }
