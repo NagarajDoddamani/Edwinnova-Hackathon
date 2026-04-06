@@ -12,7 +12,7 @@ export default function Landing() {
           <div className="size-10 rounded-xl bg-gradient-to-br from-blue-600 to-purple-600 flex items-center justify-center">
             <TrendingUp className="size-6 text-white" />
           </div>
-          <span className="text-xl font-semibold">FinanceGuide</span>
+          <span className="text-xl font-semibold">FinArmor</span>
         </div>
         <div className="flex items-center gap-3">
           <button
@@ -109,7 +109,7 @@ export default function Landing() {
       {/* Footer */}
       <footer className="border-t border-gray-200 py-8 mt-20">
         <div className="container mx-auto px-4 text-center text-gray-600">
-          <p>&copy; 2026 FinanceGuide. All rights reserved.</p>
+          <p>&copy; 2026 FinArmor. All rights reserved.</p>
         </div>
       </footer>
     </div>

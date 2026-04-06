@@ -19,6 +19,7 @@ import AnalysisCard from "../components/dashboard/AnalysisCard";
 import QueryList from "../components/dashboard/QueryList";
 import BehaviorCard from "../components/dashboard/BehaviorCard";
 import GoalPanel from "../components/dashboard/GoalPanel";
+import CreditCardFinder from "../components/dashboard/CreditCardFinder";
 
 function canNotify() {
   return typeof Notification !== "undefined";
@@ -45,9 +46,6 @@ export default function Dashboard() {
   const [queries, setQueries] = useState([]);
   const [loading, setLoading] = useState(true);
   const [behaviorLoading, setBehaviorLoading] = useState(true);
-  const [question, setQuestion] = useState("");
-  const [asking, setAsking] = useState(false);
-  const [aiAnswer, setAiAnswer] = useState(null);
   const [notificationStatus, setNotificationStatus] = useState(() =>
     canNotify() ? Notification.permission : "unsupported"
   );
@@ -177,29 +175,6 @@ export default function Dashboard() {
     }
   };
 
-  const handleAsk = async (e) => {
-    e.preventDefault();
-    const prompt = question.trim();
-    if (!prompt || asking) return;
-
-    setAsking(true);
-    setAiAnswer(null);
-
-    try {
-      const res = await api.post("/query/ask", { question: prompt });
-      setAiAnswer(res.data?.answer || res.data?.response?.summary || "No answer returned.");
-      setQuestion("");
-      const [q, b] = await Promise.all([api.get("/query/history"), api.get("/ai/dashboard")]);
-      setQueries(q.data || []);
-      setBehavior(b.data?.insight || null);
-    } catch (err) {
-      console.error(err);
-      setAiAnswer("Sorry, something went wrong. Please try again.");
-    } finally {
-      setAsking(false);
-    }
-  };
-
   const handleCreateGoal = async (goal) => {
     await api.post("/goals", goal);
     await refreshAfterChange();
@@ -299,6 +274,10 @@ export default function Dashboard() {
 
         </section>
 
+        <div className="mt-6">
+          <CreditCardFinder />
+        </div>
+
         <div className="mt-6 grid gap-6 md:grid-cols-4">
           <StatCard
             icon={<TrendingUp size={20} />}
@@ -334,6 +313,7 @@ export default function Dashboard() {
             <GoalPanel goals={goals} onCreateGoal={handleCreateGoal} />
           </div>
         </div>
+
       </div>
     </div>
   );
