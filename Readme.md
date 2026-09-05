@@ -326,5 +326,5 @@ FinArmor is not just an app —
 it is a **Financial Decision Intelligence System**.
 
 ---
-
+rebuild the backend services
 ⭐ *Built for innovation. Designed for impact.*
